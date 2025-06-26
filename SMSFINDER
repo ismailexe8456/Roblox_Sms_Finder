@@ -1,159 +1,213 @@
+import os
 import time
 import random
+import logging
 import requests
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import traceback
+import undetected_chromedriver as uc
 
-WEBHOOK_URL = "" # Your DiscordWebhook
-CHROMEDRIVER_PATH = r"" # your ChromeDriverPath
+# --- CONFIGURATION ---
+WEBHOOK_URL = "" Discord Webhook
+CHROMEDRIVER_PATH = r"" # Chrome Driver Path
 KEYWORD = "Roblox"
-DISCORD_TAG = "@"  # Change to <@YOUR_USER_ID> for guaranteed ping
+HEADLESS = False
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+DELAY_RANGE = (1.0, 2.5)
+CHECKED_FILE = "checked_numbers.txt"
+LOG_FILE = "scraper.log"
 
-# Terminal color codes
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-CYAN = "\033[96m"
-RESET = "\033[0m"
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 
-def random_delay(a=1.0, b=2.5):
-    time.sleep(random.uniform(a, b))
+def random_delay():
+    time.sleep(random.uniform(*DELAY_RANGE))
 
-def send_to_discord(number, link):
-    data = {
-        "content": f"🔔 **Roblox Number Found!** {DISCORD_TAG}\n📱 **Number:** `{number}`\n🔗 [Go to number page]({link})"
-    }
+def send_to_discord(number, link, site):
+    data = {"content": f"Site: {site}\nNumber: {number}\nLink: {link}"}
     try:
         response = requests.post(WEBHOOK_URL, json=data)
         if response.status_code in (200, 204):
-            print(f"{GREEN}✅ Sent to Discord webhook!{RESET}")
+            logging.info(f"Sent to Discord: {number} ({site})")
         else:
-            print(f"{RED}❌ Failed to send to Discord: {response.status_code} {response.text}{RESET}")
+            logging.error(f"Failed to send to Discord: {response.status_code} {response.text}")
     except Exception as e:
-        print(f"{RED}❌ Error sending to Discord: {e}{RESET}")
+        logging.error(f"Error sending to Discord: {e}")
+
+def setup_driver():
+    options = uc.ChromeOptions()
+    if HEADLESS:
+        options.headless = True
+    options.add_argument(f"user-agent={USER_AGENT}")
+    driver = uc.Chrome(options=options, executable_path=CHROMEDRIVER_PATH)
+    return driver
 
 def close_popups(driver):
-    try:
-        close_btn = driver.find_element(By.CSS_SELECTOR, ".close, .popup-close, .adsbox, .modal-close")
-        close_btn.click()
-        print(f"{YELLOW}🗙 Closed popup/ad.{RESET}")
-        time.sleep(1)
-    except Exception:
-        pass
     try:
         driver.execute_script("""
             var popups = document.querySelectorAll('.popup, .modal, .adsbox, .close, .popup-close');
             popups.forEach(function(p) { p.remove(); });
         """)
-        print(f"{YELLOW}🗑️ Removed popups with JS.{RESET}")
     except Exception:
         pass
 
-def scroll_steps(driver):
-    heights = [0.15, 0.3, 0.5, 1.0]
-    for h in heights:
-        driver.execute_script(f"window.scrollTo(0, document.body.scrollHeight*{h});")
-        time.sleep(1.2)
+def load_checked_numbers():
+    if not os.path.exists(CHECKED_FILE):
+        return set()
+    with open(CHECKED_FILE, 'r', encoding='utf-8') as f:
+        return set(line.strip() for line in f if line.strip())
 
-def wait_for_numbers(driver, timeout=15):
-    try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.XPATH, "//a[contains(text(), '+')]"))
-        )
-    except Exception:
-        pass
+def save_checked_number(number):
+    with open(CHECKED_FILE, 'a', encoding='utf-8') as f:
+        f.write(number + '\n')
 
-def check_smstome_com(driver):
-    site = "https://smstome.com/"
-    print(f"{CYAN}\n🌐 Checking {site} ...{RESET}")
-    driver.get(site)
-    random_delay(2, 4)
+# --- SITE CONFIGS ---
+SITES = [
+    {
+        "name": "smstome.com",
+        "base_url": "https://smstome.com/",
+        "country_xpath": "//a[contains(@href, '/country/')]",
+        "number_xpath": "//a[contains(@href, '/phone/')]",
+        "sms_table_xpath": "//table",
+        "sms_message_xpath": lambda keyword: f"//td[contains(translate(., '{keyword.upper()}', '{keyword.lower()}'), '{keyword.lower()}')]",
+        "pagination_selector": "div.pagination a",
+        "page_param": "?page={page}",
+    },
+    {
+        "name": "smsreceivefree.com",
+        "base_url": "https://smsreceivefree.com/",
+        "country_xpath": "//a[contains(@href, '/country/')]",
+        "number_xpath": "//a[contains(@href, '/info/')]",
+        "sms_table_xpath": "//table",
+        "sms_message_xpath": lambda keyword: f"//td[contains(translate(., '{keyword.upper()}', '{keyword.lower()}'), '{keyword.lower()}')]",
+        "pagination_selector": "div.pagination a",
+        "page_param": "?page={page}",
+    },
+    {
+        "name": "receive-smss.com",
+        "base_url": "https://receive-smss.com/",
+        "country_xpath": "//a[contains(@href, '/countries/')]",
+        "number_xpath": "//a[contains(@href, '/number/')]",
+        "sms_table_xpath": "//table",
+        "sms_message_xpath": lambda keyword: f"//td[contains(translate(., '{keyword.upper()}', '{keyword.lower()}'), '{keyword.lower()}')]",
+        "pagination_selector": "div.pagination a",
+        "page_param": "?page={page}",
+    },
+    # Add more sites here!
+]
+
+def get_total_pages(driver, pagination_selector):
+    for _ in range(10):
+        pagination = driver.find_elements(By.CSS_SELECTOR, pagination_selector)
+        page_numbers = [btn.text.strip() for btn in pagination if btn.text.strip().isdigit()]
+        if page_numbers:
+            return int(page_numbers[-1])
+        time.sleep(0.5)
+    return 1
+
+def scrape_site(driver, site):
+    print(f"\n--- Scraping {site['name']} ---")
+    driver.get(site["base_url"])
+    random_delay()
     close_popups(driver)
-    scroll_steps(driver)
+    country_links = driver.find_elements(By.XPATH, site["country_xpath"])
+    for cidx in range(len(country_links)):
+        try:
+            country_links = driver.find_elements(By.XPATH, site["country_xpath"])
+            c = country_links[cidx]
+            country_name = c.text.strip()
+            country_url = c.get_attribute('href')
+            if country_url and not country_url.startswith("http"):
+                country_url = site["base_url"].rstrip('/') + country_url
+            scrape_country(driver, site, country_url, country_name)
+        except Exception as e:
+            logging.error(f"Error in country loop: {e}")
 
-    countries = driver.find_elements(By.XPATH, "//a[contains(@href, '/country/')]")
-    if not countries:
-        print(f"{RED}❌ No country links found on smstome.com!{RESET}")
-        return
-
-    total_sent = 0
-    total_found = 0
-
-    for cidx in range(len(countries)):
-        countries = driver.find_elements(By.XPATH, "//a[contains(@href, '/country/')]")
-        if cidx >= len(countries):
-            break
-        country_name = countries[cidx].text.strip() or f"Country {cidx+1}"
-        print(f"{YELLOW}\n🚩 Checking {country_name} on smstome.com ...{RESET}")
-        ActionChains(driver).move_to_element(countries[cidx]).click().perform()
-        random_delay(2, 4)
-        close_popups(driver)
-        scroll_steps(driver)
-        wait_for_numbers(driver, timeout=15)
-
-        # --- PAGINATION LOOP ---
-        while True:
-            scroll_steps(driver)
-            wait_for_numbers(driver, timeout=10)
-            checked_numbers = set()
-            while True:
-                numbers = driver.find_elements(By.XPATH, "//a[contains(text(), '+')]")
-                found_new = False
-                for n in numbers:
+def scrape_country(driver, site, country_url, country_name):
+    driver.get(country_url)
+    random_delay()
+    close_popups(driver)
+    total_pages = get_total_pages(driver, site["pagination_selector"])
+    for page in range(1, total_pages + 1):
+        try:
+            if page > 1:
+                driver.get(f"{country_url}{site['page_param'].format(page=page)}")
+                random_delay()
+            checked_numbers = load_checked_numbers()
+            numbers = driver.find_elements(By.XPATH, site["number_xpath"])
+            print(f"\n# {country_name} Numbers (Page {page}): {len(numbers)} numbers")
+            for nidx in range(len(numbers)):
+                try:
+                    numbers = driver.find_elements(By.XPATH, site["number_xpath"])
+                    n = numbers[nidx]
                     number_text = n.text.strip()
                     number_href = n.get_attribute('href')
                     if number_text in checked_numbers:
                         continue
-                    checked_numbers.add(number_text)
-                    # Only send if the number text contains "Roblox" (case-insensitive)
-                    if KEYWORD.lower() in number_text.lower():
-                        if number_href and not number_href.startswith("http"):
-                            number_href = "https://smstome.com" + number_href
-                        print(f"{GREEN}🔔 Found: {number_text} ({number_href}){RESET}")
-                        send_to_discord(number_text, number_href)
-                        total_sent += 1
-                    else:
-                        print(f"{CYAN}🔎 Scanned: {number_text}{RESET}")
-                    total_found += 1
-                    found_new = True
-                if not found_new:
-                    break  # All numbers on this page checked
+                    if number_href and not number_href.startswith("http"):
+                        number_href = site["base_url"].rstrip('/') + number_href
+                    print(f"#{nidx+1} {number_text}", end=' ')
+                    scrape_number(driver, site, number_text, number_href)
+                    save_checked_number(number_text)
+                    # Return to the correct page after each number
+                    driver.get(f"{country_url}{site['page_param'].format(page=page)}" if page > 1 else country_url)
+                    random_delay()
+                    close_popups(driver)
+                except Exception as e:
+                    logging.error(f"Error in number loop for {country_name} {number_text}: {e}")
+        except Exception as e:
+            logging.error(f"Error in page loop for {country_name} page {page}: {e}")
 
-            # Try to go to the next page using the » button
-            next_found = False
-            next_buttons = driver.find_elements(By.CSS_SELECTOR, "ul.pagination li a")
-            for btn in next_buttons:
-                if btn.text.strip() == "»" and "disabled" not in btn.get_attribute("class"):
-                    try:
-                        btn.click()
-                        random_delay(2, 4)
-                        close_popups(driver)
-                        wait_for_numbers(driver, timeout=10)
-                        next_found = True
-                        break
-                    except Exception as e:
-                        print(f"{RED}Error clicking next page: {e}{RESET}")
-            if not next_found:
-                break  # No more pages
-
-        driver.back()
-        random_delay(2, 4)
+def scrape_number(driver, site, number_text, number_href):
+    try:
+        driver.get(number_href)
+        random_delay()
         close_popups(driver)
-
-    print(f"\n{GREEN}🎉 Done! Scanned {total_found} numbers, sent {total_sent} to Discord!{RESET}")
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, site["sms_table_xpath"]))
+            )
+        except Exception:
+            pass
+        total_sms_pages = get_total_pages(driver, site["pagination_selector"])
+        found = False
+        for sms_page in range(1, total_sms_pages + 1):
+            try:
+                if sms_page > 1:
+                    driver.get(f"{number_href}{site['page_param'].format(page=sms_page)}")
+                    random_delay()
+                    close_popups(driver)
+                    try:
+                        WebDriverWait(driver, 10).until(
+                            EC.presence_of_element_located((By.XPATH, site["sms_table_xpath"]))
+                        )
+                    except Exception:
+                        pass
+                message_xpath = site["sms_message_xpath"](KEYWORD)
+                messages = driver.find_elements(By.XPATH, message_xpath)
+                print("#", end='', flush=True)
+                if messages:
+                    send_to_discord(number_text, f"{number_href}{site['page_param'].format(page=sms_page)}", site['name'])
+                    found = True
+            except Exception as e:
+                logging.error(f"Error in SMS page loop for {number_text} page {sms_page}: {e}")
+        if not found:
+            logging.info(f"No '{KEYWORD}' found for {number_text}")
+        print()  # Newline after progress bar
+    except Exception as e:
+        logging.error(f"Error checking number {number_text}: {e}")
 
 if __name__ == "__main__":
     try:
-        driver = uc.Chrome(driver_executable_path=CHROMEDRIVER_PATH)
-        try:
-            check_smstome_com(driver)
-        finally:
-            driver.quit()
+        driver = setup_driver()
+        for site in SITES:
+            scrape_site(driver, site)
     except Exception as e:
-        print(f"{RED}FATAL ERROR:{RESET}")
+        print("FATAL ERROR:")
+        import traceback
         traceback.print_exc()
-        input("Press Enter to exit...")
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
